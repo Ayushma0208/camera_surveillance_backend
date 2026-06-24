@@ -1,0 +1,28 @@
+{
+  "name": "camera-surveillance-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot src/server.ts",
+    "start": "bun src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:studio": "prisma studio"
+  },
+  "dependencies": {
+    "@prisma/client": "6.16.2",
+    "bcrypt": "*",
+    "hono": "*",
+    "jsonwebtoken": "*",
+    "zod": "*"
+  },
+  "devDependencies": {
+    "@types/bcrypt": "*",
+    "@types/jsonwebtoken": "*",
+    "prisma": "6.16.2",
+    "typescript": "*"
+  }
+}
