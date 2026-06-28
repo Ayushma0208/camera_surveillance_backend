@@ -8,7 +8,12 @@ const envSchema = z.object({
   JWT_EXPIRES_IN: z.string().default("7d"),
   WORKER_BASE_URL: z.string().url().default("http://localhost:8001"),
   WORKER_API_KEY: z.string().optional(),
-  CORS_ORIGIN: z.string().default("*")
+  CORS_ORIGIN: z.string().default("*"),
+  RABBITMQ_URL: z.string().url().optional(),
+  CAMERA_COMMANDS_QUEUE: z.string().default("camera.commands"),
+  DETECTION_EVENTS_QUEUE: z.string().default("detection.events"),
+  ALERT_DEDUP_WINDOW_SECONDS: z.coerce.number().int().nonnegative().default(10),
+  ALERT_RATE_LIMIT_PER_CAMERA_PER_MINUTE: z.coerce.number().int().positive().default(6)
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -21,5 +26,10 @@ export const env = envSchema.parse({
   JWT_EXPIRES_IN: Bun.env.JWT_EXPIRES_IN,
   WORKER_BASE_URL: Bun.env.WORKER_BASE_URL,
   WORKER_API_KEY: Bun.env.WORKER_API_KEY,
-  CORS_ORIGIN: Bun.env.CORS_ORIGIN
+  CORS_ORIGIN: Bun.env.CORS_ORIGIN,
+  RABBITMQ_URL: Bun.env.RABBITMQ_URL,
+  CAMERA_COMMANDS_QUEUE: Bun.env.CAMERA_COMMANDS_QUEUE,
+  DETECTION_EVENTS_QUEUE: Bun.env.DETECTION_EVENTS_QUEUE,
+  ALERT_DEDUP_WINDOW_SECONDS: Bun.env.ALERT_DEDUP_WINDOW_SECONDS,
+  ALERT_RATE_LIMIT_PER_CAMERA_PER_MINUTE: Bun.env.ALERT_RATE_LIMIT_PER_CAMERA_PER_MINUTE
 });

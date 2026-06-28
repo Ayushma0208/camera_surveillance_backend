@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 from collections import deque
@@ -8,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import cv2
+import pika
 import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -16,6 +18,10 @@ from ultralytics import YOLO
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:4000").rstrip("/")
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "")
+CAMERA_COMMANDS_QUEUE = os.getenv("CAMERA_COMMANDS_QUEUE", "camera.commands")
+DETECTION_EVENTS_QUEUE = os.getenv("DETECTION_EVENTS_QUEUE", "detection.events")
+MAX_CAMERAS_PER_WORKER = int(os.getenv("MAX_CAMERAS_PER_WORKER", "10"))
 MODEL_PATH = os.getenv("MODEL_PATH", "yolov8n.pt")
 PERSON_CLASS_ID = 0
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
@@ -57,7 +63,31 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def post_event(event: dict[str, Any]) -> None:
+def publish_queue_message(queue: str, payload: dict[str, Any]) -> bool:
+    if not RABBITMQ_URL:
+        return False
+
+    try:
+        connection = pika.BlockingConnection(pika.URLParameters(RABBITMQ_URL))
+        channel = connection.channel()
+        channel.queue_declare(queue=queue, durable=True)
+        channel.basic_publish(
+            exchange="",
+            routing_key=queue,
+            body=json.dumps(payload),
+            properties=pika.BasicProperties(
+                content_type="application/json",
+                delivery_mode=2,
+            ),
+        )
+        connection.close()
+        return True
+    except Exception as error:
+        print(f"Failed to publish queue message to {queue}: {error}")
+        return False
+
+
+def post_event_http(event: dict[str, Any]) -> None:
     headers = {"content-type": "application/json"}
     if WORKER_API_KEY:
         headers["x-worker-api-key"] = WORKER_API_KEY
@@ -74,8 +104,15 @@ def post_event(event: dict[str, Any]) -> None:
         print(f"Failed to post worker event: {error}")
 
 
+def emit_event(event: dict[str, Any]) -> None:
+    if publish_queue_message(DETECTION_EVENTS_QUEUE, event):
+        return
+
+    post_event_http(event)
+
+
 def post_state(camera_id: str, status: str) -> None:
-    post_event(
+    emit_event(
         {
             "type": "state",
             "cameraId": camera_id,
@@ -144,7 +181,7 @@ def process_camera(camera_id: str, rtsp_url: str, stop_event: threading.Event) -
 
                 if now - last_detection_sent_at >= DETECTION_COOLDOWN_SECONDS:
                     last_detection_sent_at = now
-                    post_event(
+                    emit_event(
                         {
                             "type": "person_detected",
                             "cameraId": camera_id,
@@ -156,7 +193,7 @@ def process_camera(camera_id: str, rtsp_url: str, stop_event: threading.Event) -
 
             stats_elapsed = now - stats_started_at
             if stats_elapsed >= STATS_INTERVAL_SECONDS:
-                post_event(
+                emit_event(
                     {
                         "type": "stats",
                         "cameraId": camera_id,
@@ -175,6 +212,106 @@ def process_camera(camera_id: str, rtsp_url: str, stop_event: threading.Event) -
                 running_cameras.pop(camera_id, None)
 
 
+def start_camera_runtime(body: StartCameraRequest) -> dict[str, Any]:
+    if not body.enabled:
+        raise HTTPException(status_code=400, detail="Camera is disabled")
+
+    with running_cameras_lock:
+        existing = running_cameras.get(body.cameraId)
+        if existing and existing.thread.is_alive():
+            return {"ok": True, "message": "Camera already running"}
+
+        if len(running_cameras) >= MAX_CAMERAS_PER_WORKER:
+            raise HTTPException(status_code=429, detail="Worker camera capacity reached")
+
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=process_camera,
+            args=(body.cameraId, body.rtspUrl, stop_event),
+            daemon=True,
+        )
+        running_cameras[body.cameraId] = CameraRuntime(thread, stop_event)
+        thread.start()
+
+    return {"ok": True}
+
+
+def stop_camera_runtime(body: StopCameraRequest) -> dict[str, Any]:
+    with running_cameras_lock:
+        runtime = running_cameras.get(body.cameraId)
+
+    if runtime:
+        runtime.stop_event.set()
+
+    return {"ok": True}
+
+
+def handle_camera_command(command: dict[str, Any]) -> None:
+    command_type = command.get("type")
+
+    if command_type == "start_camera":
+        camera = command.get("camera") or {}
+        start_camera_runtime(
+            StartCameraRequest(
+                cameraId=camera["id"],
+                name=camera["name"],
+                rtspUrl=camera["rtspUrl"],
+                location=camera["location"],
+                enabled=camera["enabled"],
+            )
+        )
+        return
+
+    if command_type == "stop_camera":
+        stop_camera_runtime(StopCameraRequest(cameraId=command["cameraId"]))
+        return
+
+    raise ValueError(f"Unknown camera command type: {command_type}")
+
+
+def consume_camera_commands() -> None:
+    if not RABBITMQ_URL:
+        return
+
+    while True:
+        try:
+            connection = pika.BlockingConnection(pika.URLParameters(RABBITMQ_URL))
+            channel = connection.channel()
+            channel.queue_declare(queue=CAMERA_COMMANDS_QUEUE, durable=True)
+            channel.basic_qos(prefetch_count=1)
+
+            def on_message(channel: Any, method: Any, _properties: Any, body: bytes) -> None:
+                try:
+                    command = json.loads(body.decode("utf-8"))
+                    handle_camera_command(command)
+                    channel.basic_ack(delivery_tag=method.delivery_tag)
+                except HTTPException as error:
+                    requeue = error.status_code == 429
+                    print(f"Failed to handle camera command: {error.detail}")
+                    channel.basic_nack(delivery_tag=method.delivery_tag, requeue=requeue)
+                    if requeue:
+                        time.sleep(2)
+                except Exception as error:
+                    print(f"Failed to handle camera command: {error}")
+                    channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+            channel.basic_consume(queue=CAMERA_COMMANDS_QUEUE, on_message_callback=on_message)
+            print(f"Consuming camera commands from queue '{CAMERA_COMMANDS_QUEUE}'")
+            channel.start_consuming()
+        except Exception as error:
+            print(f"Camera command consumer disconnected: {error}")
+            time.sleep(5)
+
+
+@app.on_event("startup")
+def start_camera_command_consumer() -> None:
+    if not RABBITMQ_URL:
+        return
+
+    thread = threading.Thread(target=consume_camera_commands, daemon=True)
+    thread.start()
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     with running_cameras_lock:
@@ -189,25 +326,7 @@ def start_camera(
     x_worker_api_key: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     require_worker_key(x_worker_api_key)
-
-    if not body.enabled:
-        raise HTTPException(status_code=400, detail="Camera is disabled")
-
-    with running_cameras_lock:
-        existing = running_cameras.get(body.cameraId)
-        if existing and existing.thread.is_alive():
-            return {"ok": True, "message": "Camera already running"}
-
-        stop_event = threading.Event()
-        thread = threading.Thread(
-            target=process_camera,
-            args=(body.cameraId, body.rtspUrl, stop_event),
-            daemon=True,
-        )
-        running_cameras[body.cameraId] = CameraRuntime(thread, stop_event)
-        thread.start()
-
-    return {"ok": True}
+    return start_camera_runtime(body)
 
 
 @app.post("/cameras/stop")
@@ -216,11 +335,4 @@ def stop_camera(
     x_worker_api_key: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     require_worker_key(x_worker_api_key)
-
-    with running_cameras_lock:
-        runtime = running_cameras.get(body.cameraId)
-
-    if runtime:
-        runtime.stop_event.set()
-
-    return {"ok": True}
+    return stop_camera_runtime(body)

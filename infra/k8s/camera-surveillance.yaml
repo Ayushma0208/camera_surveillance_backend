@@ -1,0 +1,330 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: camera-surveillance
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: camera-surveillance-secrets
+  namespace: camera-surveillance
+type: Opaque
+stringData:
+  database-url: postgresql://postgres:postgres@postgres:5432/camera_surveillance?schema=public
+  jwt-secret: change-me-in-production
+  worker-api-key: dev-worker-secret
+  rabbitmq-url: amqp://guest:guest@rabbitmq:5672
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: camera-surveillance-config
+  namespace: camera-surveillance
+data:
+  node-env: production
+  cors-origin: "*"
+  camera-commands-queue: camera.commands
+  detection-events-queue: detection.events
+  alert-dedup-window-seconds: "10"
+  alert-rate-limit-per-camera-per-minute: "6"
+  max-cameras-per-worker: "10"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: camera-surveillance
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: camera-surveillance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              value: postgres
+            - name: POSTGRES_DB
+              value: camera_surveillance
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: camera-surveillance
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: camera-surveillance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3-management
+          ports:
+            - containerPort: 5672
+            - containerPort: 15672
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: camera-surveillance
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+    - name: management
+      port: 15672
+      targetPort: 15672
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: camera-surveillance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      initContainers:
+        - name: migrate
+          image: camera-surveillance-backend:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "bunx prisma migrate deploy"]
+          envFrom:
+            - configMapRef:
+                name: camera-surveillance-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: camera-surveillance-secrets
+                  key: database-url
+      containers:
+        - name: backend
+          image: camera-surveillance-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 4000
+          env:
+            - name: NODE_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: camera-surveillance-config
+                  key: node-env
+            - name: PORT
+              value: "4000"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: camera-surveillance-secrets
+                  key: database-url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: camera-surveillance-secrets
+                  key: jwt-secret
+            - name: JWT_EXPIRES_IN
+              value: 7d
+            - name: WORKER_BASE_URL
+              value: http://worker:8001
+            - name: WORKER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: camera-surveillance-secrets
+                  key: worker-api-key
+            - name: CORS_ORIGIN
+              valueFrom:
+                configMapKeyRef:
+                  name: camera-surveillance-config
+                  key: cors-origin
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: camera-surveillance-secrets
+                  key: rabbitmq-url
+            - name: CAMERA_COMMANDS_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: camera-surveillance-config
+                  key: camera-commands-queue
+            - name: DETECTION_EVENTS_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: camera-surveillance-config
+                  key: detection-events-queue
+            - name: ALERT_DEDUP_WINDOW_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: camera-surveillance-config
+                  key: alert-dedup-window-seconds
+            - name: ALERT_RATE_LIMIT_PER_CAMERA_PER_MINUTE
+              valueFrom:
+                configMapKeyRef:
+                  name: camera-surveillance-config
+                  key: alert-rate-limit-per-camera-per-minute
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: camera-surveillance
+spec:
+  type: LoadBalancer
+  selector:
+    app: backend
+  ports:
+    - port: 4000
+      targetPort: 4000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: camera-surveillance
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: camera-surveillance-worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8001
+          env:
+            - name: BACKEND_URL
+              value: http://backend:4000
+            - name: WORKER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: camera-surveillance-secrets
+                  key: worker-api-key
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: camera-surveillance-secrets
+                  key: rabbitmq-url
+            - name: CAMERA_COMMANDS_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: camera-surveillance-config
+                  key: camera-commands-queue
+            - name: DETECTION_EVENTS_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: camera-surveillance-config
+                  key: detection-events-queue
+            - name: MAX_CAMERAS_PER_WORKER
+              valueFrom:
+                configMapKeyRef:
+                  name: camera-surveillance-config
+                  key: max-cameras-per-worker
+            - name: MODEL_PATH
+              value: yolov8n.pt
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker
+  namespace: camera-surveillance
+spec:
+  selector:
+    app: worker
+  ports:
+    - port: 8001
+      targetPort: 8001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediamtx
+  namespace: camera-surveillance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mediamtx
+  template:
+    metadata:
+      labels:
+        app: mediamtx
+    spec:
+      containers:
+        - name: mediamtx
+          image: bluenviron/mediamtx:latest
+          ports:
+            - containerPort: 8554
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediamtx
+  namespace: camera-surveillance
+spec:
+  selector:
+    app: mediamtx
+  ports:
+    - port: 8554
+      targetPort: 8554

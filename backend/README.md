@@ -6,8 +6,9 @@ Bun + Hono API for the real-time camera surveillance dashboard.
 
 - JWT authentication with bcrypt password hashing
 - User-scoped camera CRUD
-- Camera start/stop commands sent to the worker service
-- Worker event ingestion for person alerts, camera stats, and camera state
+- Camera start/stop commands sent through RabbitMQ, with HTTP fallback
+- Worker event ingestion through RabbitMQ or HTTP for person alerts, camera stats, and camera state
+- Alert deduplication and per-camera rate limiting
 - PostgreSQL persistence through Prisma
 - Authenticated WebSocket updates at `/ws`
 
@@ -31,6 +32,11 @@ The backend listens on `PORT`, defaulting to `4000`.
 - `WORKER_BASE_URL`: worker service base URL
 - `WORKER_API_KEY`: optional shared key for backend-to-worker and worker-to-backend requests
 - `CORS_ORIGIN`: `*` or comma-separated allowed origins
+- `RABBITMQ_URL`: optional RabbitMQ URL. When set, camera commands and worker events use queues.
+- `CAMERA_COMMANDS_QUEUE`: queue for `start_camera` and `stop_camera` commands
+- `DETECTION_EVENTS_QUEUE`: queue for worker detection, stats, and state events
+- `ALERT_DEDUP_WINDOW_SECONDS`: duplicate alert suppression window per camera
+- `ALERT_RATE_LIMIT_PER_CAMERA_PER_MINUTE`: stored alert cap per camera
 
 ## Authentication
 
@@ -82,22 +88,28 @@ Available camera routes:
 - `POST /cameras/:id/start`
 - `POST /cameras/:id/stop`
 
-Start sends this worker command to `WORKER_BASE_URL/cameras/start`:
+Start publishes this command to `CAMERA_COMMANDS_QUEUE` when `RABBITMQ_URL` is set. Without RabbitMQ it falls back to `WORKER_BASE_URL/cameras/start`:
 
 ```json
 {
-  "cameraId": "camera-id",
-  "name": "Front Gate",
-  "rtspUrl": "rtsp://example.local/front",
-  "location": "Entrance",
-  "enabled": true
+  "type": "start_camera",
+  "commandId": "command-id",
+  "camera": {
+    "id": "camera-id",
+    "name": "Front Gate",
+    "rtspUrl": "rtsp://example.local/front",
+    "location": "Entrance",
+    "enabled": true
+  }
 }
 ```
 
-Stop sends this worker command to `WORKER_BASE_URL/cameras/stop`:
+Stop publishes this command to `CAMERA_COMMANDS_QUEUE` when `RABBITMQ_URL` is set. Without RabbitMQ it falls back to `WORKER_BASE_URL/cameras/stop`:
 
 ```json
 {
+  "type": "stop_camera",
+  "commandId": "command-id",
   "cameraId": "camera-id"
 }
 ```
@@ -120,7 +132,7 @@ GET /alerts?cameraId=<uuid>&from=2026-06-23T10:00:00Z&page=1&limit=20
 
 ## Worker Events
 
-`POST /worker/events` accepts `x-worker-api-key` when `WORKER_API_KEY` is set.
+Worker events are consumed from `DETECTION_EVENTS_QUEUE` when `RABBITMQ_URL` is set. `POST /worker/events` remains available and accepts `x-worker-api-key` when `WORKER_API_KEY` is set.
 
 Person detection event:
 

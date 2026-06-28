@@ -1,5 +1,8 @@
+import { randomUUID } from "node:crypto";
 import type { Camera } from "@prisma/client";
 import { env } from "../config/env";
+import { isQueueEnabled, publishJson } from "./messageQueue";
+import type { CameraCommand } from "../types/queues";
 import { badGateway } from "../utils/errors";
 
 type WorkerCameraPayload = Pick<
@@ -28,16 +31,46 @@ const postToWorker = async (path: string, body: unknown) => {
   }
 };
 
-export const startCameraWorker = (camera: WorkerCameraPayload) =>
-  postToWorker("/cameras/start", {
+export const startCameraWorker = async (camera: WorkerCameraPayload) => {
+  if (isQueueEnabled()) {
+    const command: CameraCommand = {
+      type: "start_camera",
+      commandId: randomUUID(),
+      camera: {
+        id: camera.id,
+        name: camera.name,
+        rtspUrl: camera.rtspUrl,
+        location: camera.location,
+        enabled: camera.enabled
+      }
+    };
+
+    await publishJson(env.CAMERA_COMMANDS_QUEUE, command);
+    return;
+  }
+
+  await postToWorker("/cameras/start", {
     cameraId: camera.id,
     name: camera.name,
     rtspUrl: camera.rtspUrl,
     location: camera.location,
     enabled: camera.enabled
   });
+};
 
-export const stopCameraWorker = (cameraId: string) =>
-  postToWorker("/cameras/stop", {
+export const stopCameraWorker = async (cameraId: string) => {
+  if (isQueueEnabled()) {
+    const command: CameraCommand = {
+      type: "stop_camera",
+      commandId: randomUUID(),
+      cameraId
+    };
+
+    await publishJson(env.CAMERA_COMMANDS_QUEUE, command);
+    return;
+  }
+
+  await postToWorker("/cameras/stop", {
     cameraId
   });
+};

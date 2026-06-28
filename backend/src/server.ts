@@ -3,6 +3,7 @@ import { app } from "./app";
 import { env } from "./config/env";
 import { verifyAuthToken } from "./services/tokens";
 import { wsHub } from "./services/wsHub";
+import { startWorkerEventConsumer } from "./services/workerEventConsumer";
 
 const { upgradeWebSocket, websocket } = createBunWebSocket();
 
@@ -44,3 +45,7 @@ const server = Bun.serve({
 });
 
 console.log(`Backend API listening on http://localhost:${server.port}`);
+
+startWorkerEventConsumer().catch((error) => {
+  console.error("Worker event consumer failed to start", error);
+});

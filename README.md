@@ -5,9 +5,22 @@ Dockerized local setup for the camera surveillance assignment backend and worker
 ## Services
 
 - `postgres`: PostgreSQL database
+- `rabbitmq`: message broker for camera commands and worker events, management UI on `http://localhost:15672`
 - `backend`: Bun + Hono API on `http://localhost:4000`
 - `worker`: Python + FastAPI worker on `http://localhost:8001`
 - `mediamtx`: local RTSP server on `rtsp://localhost:8554`
+
+## Architecture
+
+Camera start/stop requests are published by the backend to RabbitMQ queue `camera.commands`. Worker replicas compete for those commands, start or stop camera runtimes independently, and publish person detections, stats, and state changes to queue `detection.events`.
+
+The backend consumes `detection.events`, validates the event format, applies alert deduplication and per-camera rate limiting, stores accepted alerts in Postgres, and pushes realtime updates over WebSocket.
+
+Alert controls:
+
+- `ALERT_DEDUP_WINDOW_SECONDS`: suppresses duplicate `person_detected` alerts for the same camera inside this window.
+- `ALERT_RATE_LIMIT_PER_CAMERA_PER_MINUTE`: maximum stored person alerts per camera per minute.
+- `MAX_CAMERAS_PER_WORKER`: caps active camera runtimes in each worker container.
 
 ## Run With Docker Compose
 
@@ -90,3 +103,37 @@ docker compose logs -f worker
 docker compose down
 docker compose down -v
 ```
+
+Scale worker replicas locally:
+
+```sh
+docker compose up --build --scale worker=2
+```
+
+## Tests
+
+Run unit tests:
+
+```sh
+cd backend
+bun test
+```
+
+Run opt-in integration tests against a configured test database:
+
+```sh
+cd backend
+RUN_INTEGRATION_TESTS=true bun test
+```
+
+## Kubernetes
+
+Build local images and apply the manifests:
+
+```sh
+docker build -t camera-surveillance-backend:latest ./backend
+docker build -t camera-surveillance-worker:latest ./worker
+kubectl apply -f infra/k8s/camera-surveillance.yaml
+```
+
+More details are in `infra/k8s/README.md`.

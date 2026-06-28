@@ -15,6 +15,17 @@ services:
       timeout: 5s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   backend:
     build:
       context: ./backend
@@ -27,10 +38,17 @@ services:
       WORKER_BASE_URL: http://worker:8001
       WORKER_API_KEY: dev-worker-secret
       CORS_ORIGIN: "*"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      CAMERA_COMMANDS_QUEUE: camera.commands
+      DETECTION_EVENTS_QUEUE: detection.events
+      ALERT_DEDUP_WINDOW_SECONDS: 10
+      ALERT_RATE_LIMIT_PER_CAMERA_PER_MINUTE: 6
     ports:
       - "4000:4000"
     depends_on:
       postgres:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     command: sh -c "bunx prisma migrate deploy && bun run start"
     healthcheck:
@@ -51,15 +69,21 @@ services:
     environment:
       BACKEND_URL: http://backend:4000
       WORKER_API_KEY: dev-worker-secret
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      CAMERA_COMMANDS_QUEUE: camera.commands
+      DETECTION_EVENTS_QUEUE: detection.events
       MODEL_PATH: yolov8n.pt
       CONFIDENCE_THRESHOLD: 0.45
       DETECTION_COOLDOWN_SECONDS: 5
       STATS_INTERVAL_SECONDS: 10
       SAMPLE_EVERY_N_FRAMES: 5
+      MAX_CAMERAS_PER_WORKER: 10
     ports:
       - "8001:8001"
     depends_on:
       backend:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     healthcheck:
       test:
